@@ -9,7 +9,8 @@ namespace FacebonkClickIDRemoverProxy
 	{
 		static void Main(string[] args)
 		{
-			CreateHostBuilder(args).Build().Run();
+			if (!new StatusConsole().Run())
+				CreateHostBuilder(args).Build().Run();
 		}
 
 		public static IWebHostBuilder CreateHostBuilder(string[] args)

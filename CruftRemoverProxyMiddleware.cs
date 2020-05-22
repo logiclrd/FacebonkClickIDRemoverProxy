@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 
 using Microsoft.AspNetCore.Http;
@@ -17,7 +18,22 @@ namespace FacebonkClickIDRemoverProxy
 	public class CruftRemoverProxyMiddleware
 	{
 		ICruftRemoverConfiguration _configuration;
+		IStatusConsoleSender _statusConsoleSender;
 		RequestDelegate _next;
+
+		public CruftRemoverProxyMiddleware(ICruftRemoverConfiguration configuration, ObjectPoolProvider objectPoolProvider, IStatusConsoleSender statusConsoleSender, RequestDelegate next)
+		{
+			_configuration = configuration;
+			_statusConsoleSender = statusConsoleSender;
+			_next = next;
+
+			_client = new HttpClient();
+			_bufferPool = objectPoolProvider.Create<ReadBuffer>();
+
+			foreach (var property in typeof(HttpMethod).GetProperties(BindingFlags.Public | BindingFlags.Static))
+				if ((property.PropertyType == typeof(HttpMethod)) && (property.GetIndexParameters().Length == 0))
+					_httpMethodByName[property.Name] = (HttpMethod)property.GetValue(null);
+		}
 
 		HttpClient _client;
 		ObjectPool<ReadBuffer> _bufferPool;
@@ -52,118 +68,127 @@ namespace FacebonkClickIDRemoverProxy
 
 		ConcurrentDictionary<string, HttpMethod> _httpMethodByName = new ConcurrentDictionary<string, HttpMethod>(StringComparer.InvariantCultureIgnoreCase);
 
-		public CruftRemoverProxyMiddleware(ICruftRemoverConfiguration configuration, ObjectPoolProvider objectPoolProvider, RequestDelegate next)
-		{
-			_configuration = configuration;
-			_next = next;
-
-			_client = new HttpClient();
-			_bufferPool = objectPoolProvider.Create<ReadBuffer>();
-
-			foreach (var property in typeof(HttpMethod).GetProperties(BindingFlags.Public | BindingFlags.Static))
-				if ((property.PropertyType == typeof(HttpMethod)) && (property.GetIndexParameters().Length == 0))
-					_httpMethodByName[property.Name] = (HttpMethod)property.GetValue(null);
-		}
+		static int s_nextRequestID;
 
 		public async Task InvokeAsync(HttpContext context)
 		{
-			var forwardedRequestMessage = new HttpRequestMessage();
+			int requestID = Interlocked.Increment(ref s_nextRequestID);
 
-			if (!_httpMethodByName.TryGetValue(context.Request.Method, out var method))
+			_statusConsoleSender.NotifyNewRequest(requestID, context.Connection.RemoteIpAddress.ToString(), context.Request.Method, context.Request.Path);
+
+			try
 			{
-				method = new HttpMethod(context.Request.Method);
+				var forwardedRequestMessage = new HttpRequestMessage();
 
-				_httpMethodByName.TryAdd(context.Request.Method, method);
-			}
-
-			foreach (var header in context.Request.Headers)
-				forwardedRequestMessage.Headers.TryAddWithoutValidation(header.Key, (IEnumerable<string>)header.Value);
-
-			var query = new Dictionary<string, StringValues>(context.Request.Query);
-
-			query.Remove("fbclid");
-
-			string queryString = "";
-
-			if (query.Count > 0)
-				queryString = "?" + new QueryCollection(query).ToString();
-
-			forwardedRequestMessage.Method = method;
-			forwardedRequestMessage.RequestUri = new Uri(_configuration.TargetBaseURI + context.Request.Path + queryString);
-
-			if (!string.IsNullOrWhiteSpace(context.Request.ContentType))
-			{
-				forwardedRequestMessage.Content = new StreamContent(context.Request.Body);
-				forwardedRequestMessage.Content.Headers.ContentType = new MediaTypeHeaderValue(context.Request.ContentType);
-			}
-
-			var response = await _client.SendAsync(forwardedRequestMessage);
-
-			context.Response.StatusCode = (int)response.StatusCode;
-
-			foreach (var header in response.Headers.Concat(response.Content.Headers))
-			{
-				string firstValue = null;
-				List<string> allValues = null;
-
-				foreach (var value in header.Value)
+				if (!_httpMethodByName.TryGetValue(context.Request.Method, out var method))
 				{
-					if (firstValue == null)
-						firstValue = value;
+					method = new HttpMethod(context.Request.Method);
+
+					_httpMethodByName.TryAdd(context.Request.Method, method);
+				}
+
+				foreach (var header in context.Request.Headers)
+					forwardedRequestMessage.Headers.TryAddWithoutValidation(header.Key, (IEnumerable<string>)header.Value);
+
+				var query = new Dictionary<string, StringValues>(context.Request.Query);
+
+				query.Remove("fbclid");
+
+				string queryString = "";
+
+				if (query.Count > 0)
+					queryString = QueryString.Create(query).ToString();
+
+				forwardedRequestMessage.Method = method;
+				forwardedRequestMessage.RequestUri = new Uri(_configuration.TargetBaseURI + context.Request.Path + queryString);
+
+				if (!string.IsNullOrWhiteSpace(context.Request.ContentType))
+				{
+					forwardedRequestMessage.Content = new StreamContent(context.Request.Body);
+					forwardedRequestMessage.Content.Headers.ContentType = new MediaTypeHeaderValue(context.Request.ContentType);
+				}
+
+				_statusConsoleSender.NotifyRequestSent(requestID);
+
+				var response = await _client.SendAsync(forwardedRequestMessage, HttpCompletionOption.ResponseHeadersRead);
+
+				context.Response.StatusCode = (int)response.StatusCode;
+
+				foreach (var header in response.Headers.Concat(response.Content.Headers))
+				{
+					string firstValue = null;
+					List<string> allValues = null;
+
+					foreach (var value in header.Value)
+					{
+						if (firstValue == null)
+							firstValue = value;
+						else
+						{
+							if (allValues == null)
+							{
+								allValues = new List<string>();
+								allValues.Add(firstValue);
+							}
+
+							allValues.Add(value);
+						}
+					}
+
+					var values = allValues == null
+						? new StringValues(firstValue)
+						: new StringValues(allValues.ToArray());
+
+					context.Response.Headers.Add(header.Key, values);
+
+					if (header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+						_statusConsoleSender.NotifyRequestLength(requestID, long.Parse(firstValue));
+				}
+
+				using (var responseStream = await response.Content.ReadAsStreamAsync())
+				using (var bufferLease = new ReadBufferLease(_bufferPool))
+				{
+					var buffer = bufferLease.BufferObject.Buffer;
+
+					if (response.Content.Headers.ContentLength is long bytesRemaining)
+					{
+						while (bytesRemaining > 0)
+						{
+							int readLength = (bytesRemaining > buffer.Length) ? buffer.Length : (int)bytesRemaining;
+
+							int bytesRead = await responseStream.ReadAsync(buffer, 0, readLength);
+
+							if (bytesRead <= 0)
+								throw new Exception("Unexpected short read");
+
+							await context.Response.Body.WriteAsync(buffer, 0, bytesRead);
+
+							bytesRemaining -= bytesRead;
+
+							_statusConsoleSender.NotifyRequestProgress(requestID, bytesRead);
+						}
+					}
 					else
 					{
-						if (allValues == null)
+						while (true)
 						{
-							allValues = new List<string>();
-							allValues.Add(firstValue);
+							int bytesRead = await responseStream.ReadAsync(buffer, 0, buffer.Length);
+
+							if (bytesRead < 0)
+								throw new Exception("I/O error");
+							if (bytesRead == 0)
+								break;
+
+							await context.Response.Body.WriteAsync(buffer, 0, bytesRead);
+
+							_statusConsoleSender.NotifyRequestProgress(requestID, bytesRead);
 						}
-
-						allValues.Add(value);
 					}
 				}
-
-				var values = allValues == null
-					? new StringValues(firstValue)
-					: new StringValues(allValues.ToArray());
-
-				context.Response.Headers.Add(header.Key, values);
 			}
-
-			using (var responseStream = await response.Content.ReadAsStreamAsync())
-			using (var bufferLease = new ReadBufferLease(_bufferPool))
+			finally
 			{
-				var buffer = bufferLease.BufferObject.Buffer;
-
-				if (response.Content.Headers.ContentLength is long bytesRemaining)
-				{
-					while (bytesRemaining > 0)
-					{
-						int readLength = (bytesRemaining > buffer.Length) ? buffer.Length : (int)bytesRemaining;
-
-						int bytesRead = await responseStream.ReadAsync(buffer, 0, readLength);
-
-						if (bytesRead <= 0)
-							throw new Exception("Unexpected short read");
-
-						await context.Response.Body.WriteAsync(buffer, 0, bytesRead);
-
-						bytesRemaining -= bytesRead;
-					}
-				}
-				else
-				{
-					while (true)
-					{
-						int bytesRead = await responseStream.ReadAsync(buffer, 0, buffer.Length);
-
-						if (bytesRead < 0)
-							throw new Exception("I/O error");
-						if (bytesRead == 0)
-							break;
-
-						await context.Response.Body.WriteAsync(buffer, 0, bytesRead);
-					}
-				}
+				_statusConsoleSender.NotifyRequestEnd(requestID);
 			}
 		}
 	}

@@ -14,6 +14,7 @@ namespace FacebonkClickIDRemoverProxy
 		public void ConfigureServices(IServiceCollection services)
 		{
 			services.AddSingleton<ICruftRemoverConfiguration, CruftRemoverConfiguration>();
+			services.AddSingleton<IStatusConsoleSender>(StatusConsole.Launch());
 		}
 
 		public void Configure(IApplicationBuilder app)
