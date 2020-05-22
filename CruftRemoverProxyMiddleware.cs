@@ -156,12 +156,15 @@ namespace FacebonkClickIDRemoverProxy
 						{
 							int readLength = (bytesRemaining > buffer.Length) ? buffer.Length : (int)bytesRemaining;
 
-							int bytesRead = await responseStream.ReadAsync(buffer, 0, readLength);
+							int bytesRead = await responseStream.ReadAsync(buffer, 0, readLength, context.RequestAborted);
 
 							if (bytesRead <= 0)
 								throw new Exception("Unexpected short read");
 
 							await context.Response.Body.WriteAsync(buffer, 0, bytesRead);
+
+							if (context.RequestAborted.IsCancellationRequested)
+								break;
 
 							bytesRemaining -= bytesRead;
 
@@ -172,7 +175,7 @@ namespace FacebonkClickIDRemoverProxy
 					{
 						while (true)
 						{
-							int bytesRead = await responseStream.ReadAsync(buffer, 0, buffer.Length);
+							int bytesRead = await responseStream.ReadAsync(buffer, 0, buffer.Length, context.RequestAborted);
 
 							if (bytesRead < 0)
 								throw new Exception("I/O error");
@@ -181,11 +184,15 @@ namespace FacebonkClickIDRemoverProxy
 
 							await context.Response.Body.WriteAsync(buffer, 0, bytesRead);
 
+							if (context.RequestAborted.IsCancellationRequested)
+								break;
+
 							_statusConsoleSender.NotifyRequestProgress(requestID, bytesRead);
 						}
 					}
 				}
 			}
+			catch (TaskCanceledException) { }
 			finally
 			{
 				_statusConsoleSender.NotifyRequestEnd(requestID);
